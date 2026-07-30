@@ -45,28 +45,82 @@ TABLES = {
 
 CSS = """
 <style>
+  /* Page canvas follows Streamlit's own theme variables (they flip
+     automatically with System/Light/Dark from the app menu) instead of a
+     hardcoded light palette. Hardcoding this is what caused native widgets
+     (tabs, inputs) -- which Streamlit already themes correctly per mode --
+     to end up rendered against a background that no longer matched, making
+     some of their text disappear in Dark mode. A plain hex is kept first as
+     a fallback for browsers without color-mix()/var() support; the later
+     declaration wins where supported. */
   .stApp { background: #f8fafc; color: #13243e; }
+  .stApp { background: var(--background-color); color: var(--text-color); }
+
+  /* The sidebar keeps its brand gradient in every theme -- a fixed brand
+     surface, not something that should flip with light/dark. */
   [data-testid="stSidebar"] { background: linear-gradient(180deg,#1768aa 0%,#154f86 100%); }
   [data-testid="stSidebar"] > div:first-child { height:100vh; overflow-y:hidden !important; }
-  [data-testid="stSidebar"] * { color: #edf8ff !important; }
+
+  /* Only plain sidebar text (labels, captions, nav items) gets the forced
+     light color for contrast against the blue gradient. Interactive control
+     internals -- the "Signed in as" selectbox's own trigger/typed text and
+     its dropdown popover -- are explicitly excluded: Streamlit already
+     themes those correctly for light/dark on their own light/dark control
+     surface, and the previous blanket `* { color: #edf8ff !important }`
+     rule overrode that, which is why the typed text nearly disappeared. */
+  [data-testid="stSidebar"] label,
+  [data-testid="stSidebar"] p,
+  [data-testid="stSidebar"] span,
+  [data-testid="stSidebar"] .stCaptionContainer,
+  [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] { color: #edf8ff; }
+  [data-testid="stSidebar"] [data-baseweb="select"] *,
+  [data-testid="stSidebar"] [data-baseweb="popover"] *,
+  [data-testid="stSidebar"] input { color: inherit !important; }
+
   [data-testid="stSidebar"] [data-testid="stRadio"] label { border-radius:9px; padding:.24rem .42rem; margin:.02rem 0; min-height:30px; }
-  [data-testid="stSidebar"] [data-testid="stRadio"] label p { font-size:.86rem; }
+  [data-testid="stSidebar"] [data-testid="stRadio"] label p { font-size:.86rem; color: #edf8ff; }
   [data-testid="stSidebar"] [data-testid="stRadio"] { gap:0 !important; }
   [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) { background:rgba(255,255,255,.96); }
   [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) * { color:#14579b !important; font-weight:700; }
   .brand-sub {font-size:.72rem; color:#d9ecfb; margin:.3rem 0 .6rem;}
+
+  /* Cards/panels/topbar/forms: a subtle theme-aware surface a hair off the
+     page background, with a border that's a soft tint of the text color
+     (a light hairline in Light mode, a soft light hairline in Dark mode)
+     instead of a hardcoded white card that turned into a glaring box on a
+     dark page. Static fallback colors precede each adaptive declaration. */
   .topbar {display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #e4ebf3; background:#fff; padding:.45rem 1.15rem .55rem; margin:-1rem -1rem 1.1rem;}
-  .topbar-title {font-weight:750;color:#17599d;font-size:1.05rem}.topbar-user {font-size:.85rem;color:#253858;text-align:right}.topbar-user span {color:#6c7d92;font-size:.74rem}
+  .topbar {border-bottom:1px solid color-mix(in srgb, var(--text-color) 12%, transparent); background:var(--background-color);}
+  .topbar-title {font-weight:750;color:#17599d;font-size:1.05rem}
+  .topbar-title {color: color-mix(in srgb, var(--text-color) 40%, #1768aa 60%);}
+  .topbar-user {font-size:.85rem;color:#253858;text-align:right}
+  .topbar-user {color: var(--text-color);}
+  .topbar-user span {color:#6c7d92;font-size:.74rem}
+  .topbar-user span {color: color-mix(in srgb, var(--text-color) 55%, transparent);}
   .eyebrow {font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; color:#4b7087; font-weight:700;}
+  .eyebrow {color: color-mix(in srgb, var(--text-color) 55%, #1768aa 45%);}
   .page-title {font-size:1.7rem;font-weight:750;color:#102c42;margin:0 0 .2rem;}
+  .page-title {color: var(--text-color);}
   .page-copy {color:#587085;margin:0 0 1.4rem;}
-  .metric-card {background:#fff;border:1px solid #e2eaf0;border-radius:12px;padding:1rem 1.1rem;min-height:108px;box-shadow:0 2px 8px rgba(17,55,78,.035);}
-  .metric-label {font-size:.8rem;color:#597184;font-weight:650}.metric-value {font-size:1.65rem;color:#102c42;font-weight:760;margin-top:.25rem}.metric-delta {font-size:.75rem;color:#16825d;margin-top:.25rem}
+  .page-copy {color: color-mix(in srgb, var(--text-color) 65%, transparent);margin:0 0 1.4rem;}
+  .metric-card {background:#fff;border:1px solid #e2eaf0;border-radius:12px;padding:1rem 1.1rem;min-height:108px;}
+  .metric-card {background: var(--secondary-background-color);border:1px solid color-mix(in srgb, var(--text-color) 10%, transparent);}
+  .metric-label {font-size:.8rem;color:#597184;font-weight:650}
+  .metric-label {color: color-mix(in srgb, var(--text-color) 65%, transparent);}
+  .metric-value {font-size:1.65rem;color:#102c42;font-weight:760;margin-top:.25rem}
+  .metric-value {color: var(--text-color);}
+  .metric-delta {font-size:.75rem;color:#16825d;margin-top:.25rem}
+  .metric-delta {color: color-mix(in srgb, var(--text-color) 55%, #16825d 45%);}
   .panel {background:white;border:1px solid #e2eaf0;border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem;}
+  .panel {background: var(--secondary-background-color);border:1px solid color-mix(in srgb, var(--text-color) 10%, transparent);}
   .status {display:inline-block;padding:.22rem .6rem;border-radius:99px;font-size:.75rem;font-weight:700;background:#e7f8ef;color:#147151}
+  .status {background: color-mix(in srgb, var(--background-color) 78%, #16825d 22%);color: color-mix(in srgb, var(--text-color) 70%, #0e6a49 30%);}
   .alert {border-left:4px solid #f59e0b;background:#fffbeb;padding:.8rem 1rem;border-radius:6px;margin:.5rem 0;color:#7a4b05}
+  .alert {background: color-mix(in srgb, var(--background-color) 82%, #f59e0b 18%);color: color-mix(in srgb, var(--text-color) 65%, #7a4b05 35%);}
   .muted {color:#658092;font-size:.84rem}
+  .muted {color: color-mix(in srgb, var(--text-color) 60%, transparent);}
   div[data-testid="stForm"] {border:1px solid #e2eaf0;background:#fff;border-radius:14px;padding:1.1rem;}
+  div[data-testid="stForm"] {border:1px solid color-mix(in srgb, var(--text-color) 10%, transparent);background: var(--secondary-background-color);}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -921,14 +975,27 @@ def billing() -> None:
         display_df["Amount"] = display_df["Amount"].map(lambda v: f"SAR {v:,.0f}")
         display_df["Due date"] = pd.to_datetime(display_df["Due date"]).dt.strftime("%d %b %Y")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
-        selected_invoice = st.selectbox("Open invoice", df["Invoice"].tolist(), key="billing_selected_invoice")
-        row = next(i for i in invoices if i["Invoice"] == selected_invoice)
-        with st.expander(f"Invoice detail: {selected_invoice}", expanded=True):
-            a, b = st.columns(2)
-            with a:
-                st.write(f"**Patient:** {row['Patient']}\n\n**Payer:** {row['Payer']}\n\n**Status:** {row['Status']}")
-            with b:
-                st.write(f"**Amount:** SAR {row['Amount']:,.0f}\n\n**Due date:** {row['Due date'].strftime('%d %b %Y')}\n\n**Aging:** {aging_bucket(row['Due date'], row['Status'], today)}")
+        # No default selection: previously this always opened INV-8841 below
+        # even before anyone searched or picked anything, which read as if
+        # that invoice were somehow pre-selected. Blank + placeholder makes
+        # it an actual search/lookup step.
+        selected_invoice = st.selectbox(
+            "Open invoice",
+            df["Invoice"].tolist(),
+            index=None,
+            placeholder="Search by invoice number…",
+            key="billing_selected_invoice",
+        )
+        if not selected_invoice:
+            st.caption("Search or select an invoice above to see its detail.")
+        else:
+            row = next(i for i in invoices if i["Invoice"] == selected_invoice)
+            with st.expander(f"Invoice detail: {selected_invoice}", expanded=True):
+                a, b = st.columns(2)
+                with a:
+                    st.write(f"**Patient:** {row['Patient']}\n\n**Payer:** {row['Payer']}\n\n**Status:** {row['Status']}")
+                with b:
+                    st.write(f"**Amount:** SAR {row['Amount']:,.0f}\n\n**Due date:** {row['Due date'].strftime('%d %b %Y')}\n\n**Aging:** {aging_bucket(row['Due date'], row['Status'], today)}")
 
     with tab2:
         open_invoices = [i for i in invoices if i["Status"] != "Paid"]
@@ -991,8 +1058,8 @@ def claims() -> None:
             )
             claim_column = "Claim" if "Claim" in candidates.columns else candidates.columns[0]
             selected_rows = selection.selection.rows
+            selected_claims_df = candidates.iloc[selected_rows] if selected_rows else candidates.iloc[0:0]
             if selected_rows:
-                selected_claims = candidates.iloc[selected_rows]
                 st.caption(f"{len(selected_rows)} claim(s) selected.")
                 bcol1, bcol2 = st.columns([2, 1])
                 bulk_action = bcol1.selectbox(
@@ -1002,22 +1069,43 @@ def claims() -> None:
                 )
                 if bcol2.button("Apply to selected", type="primary", use_container_width=True):
                     actions = st.session_state.setdefault("claim_review_actions", {})
-                    for _, row in selected_claims.iterrows():
+                    for _, row in selected_claims_df.iterrows():
                         actions[str(row[claim_column])] = bulk_action
                     st.success(f"Applied '{bulk_action}' to {len(selected_rows)} claim(s).")
 
-            selected_claim = st.selectbox("Select claim for detailed review", candidates[claim_column].astype(str).tolist(), key="selected_claim")
-            claim = candidates[candidates[claim_column].astype(str) == selected_claim].iloc[0].to_dict()
-            finding = claim.get("AI finding", claim.get("ai_finding", "Review required"))
-            details = claim_review_details(selected_claim, finding)
-            with st.expander(f"Claim review: {selected_claim}", expanded=True):
-                a, b = st.columns([1.2, 1])
-                with a: st.write(f"**Finding:** {details['finding']}\n\n**Recommendation:** {details['recommendation']}")
-                with b:
-                    resolution = st.selectbox("Resolution", details["resolutions"], key=f"resolution_{selected_claim}")
-                    if st.button("Record review action", type="primary", key=f"review_{selected_claim}"):
-                        st.session_state.setdefault("claim_review_actions", {})[selected_claim] = resolution
-                        st.success(f"Review action recorded for {selected_claim}: {resolution}")
+            st.divider()
+            st.subheader("Claim review")
+            # Reuse the row you already clicked above instead of asking you
+            # to pick the same claim a second time in a separate dropdown
+            # that also used to default to CLM-20031 as if pre-selected. A
+            # search box only appears as a fallback when nothing is selected
+            # in the grid, and it starts blank.
+            if len(selected_rows) == 1:
+                selected_claim = str(selected_claims_df.iloc[0][claim_column])
+                st.caption(f"Reviewing the row selected above ({selected_claim}). Clear the row selection or use search below to review a different claim.")
+            else:
+                selected_claim = st.selectbox(
+                    "Search for a claim to review",
+                    candidates[claim_column].astype(str).tolist(),
+                    index=None,
+                    placeholder="Search by claim number, payer, or finding…",
+                    key="selected_claim",
+                )
+
+            if not selected_claim:
+                st.caption("Select a single row above, or search for a claim, to open its detailed review.")
+            else:
+                claim = candidates[candidates[claim_column].astype(str) == selected_claim].iloc[0].to_dict()
+                finding = claim.get("AI finding", claim.get("ai_finding", "Review required"))
+                details = claim_review_details(selected_claim, finding)
+                with st.expander(f"Claim review: {selected_claim}", expanded=True):
+                    a, b = st.columns([1.2, 1])
+                    with a: st.write(f"**Finding:** {details['finding']}\n\n**Recommendation:** {details['recommendation']}")
+                    with b:
+                        resolution = st.selectbox("Resolution", details["resolutions"], key=f"resolution_{selected_claim}")
+                        if st.button("Record review action", type="primary", key=f"review_{selected_claim}"):
+                            st.session_state.setdefault("claim_review_actions", {})[selected_claim] = resolution
+                            st.success(f"Review action recorded for {selected_claim}: {resolution}")
             actions = st.session_state.get("claim_review_actions", {})
             if actions:
                 st.caption(f"{len(actions)} claim(s) have a recorded action this session.")
