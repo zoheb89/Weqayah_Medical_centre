@@ -18,6 +18,7 @@ import streamlit as st
 
 try:
     from databricks import sql
+    from databricks.sdk import WorkspaceClient
     from databricks.sdk.core import Config
     DATABRICKS_AVAILABLE = True
 except ImportError:
@@ -30,6 +31,9 @@ CATALOG = os.getenv("MERIDIAN_CATALOG", "meridian")
 GOLD_SCHEMA = os.getenv("MERIDIAN_GOLD_SCHEMA", "gold")
 WRITE_TABLE = os.getenv("MERIDIAN_WRITE_TABLE", f"{CATALOG}.lakebase.patient_registration")
 WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID")
+# Injected automatically when a Genie Space resource is attached to this Databricks
+# App (see app.yaml). Without it, the assistant falls back to demo answers.
+GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID")
 TABLES = {
     "patients": os.getenv("MERIDIAN_PATIENT_TABLE", f"{CATALOG}.{GOLD_SCHEMA}.dim_patient"),
     "visits": os.getenv("MERIDIAN_VISIT_TABLE", f"{CATALOG}.{GOLD_SCHEMA}.fact_visits"),
@@ -173,6 +177,82 @@ def safe_table(key: str) -> str:
 def live_or_demo(key: str, demo: pd.DataFrame, limit: int = 100) -> pd.DataFrame:
     frame = query(f"SELECT * FROM {safe_table(key)} LIMIT {limit}")
     return frame if not frame.empty else demo
+
+
+def genie_client() -> Optional["WorkspaceClient"]:
+    """Return a cached WorkspaceClient for Genie calls, or None if unavailable.
+
+    Mirrors connection() above: session-cached, never raises, so a missing or
+    misconfigured Genie space degrades to demo mode instead of breaking the page.
+    """
+    if not (DATABRICKS_AVAILABLE and GENIE_SPACE_ID):
+        return None
+    if "weqayah_genie_client" in st.session_state:
+        return st.session_state.weqayah_genie_client
+    try:
+        st.session_state.weqayah_genie_client = WorkspaceClient()
+        return st.session_state.weqayah_genie_client
+    except Exception:
+        return None
+
+
+def genie_ready() -> bool:
+    try:
+        return genie_client() is not None
+    except Exception:
+        return False
+
+
+def ask_genie(question: str) -> tuple[str, bool]:
+    """Ask the configured Genie space a question in real time.
+
+    Returns (answer_text, is_live). is_live is False whenever the call falls back
+    to a canned demo answer, so the UI can be honest about which path answered —
+    the same transparency principle used by db_ready()/live_or_demo() elsewhere.
+    """
+    client = genie_client()
+    if client is None:
+        return _demo_genie_answer(question), False
+    try:
+        conversation_id = st.session_state.get("genie_conversation_id")
+        if conversation_id:
+            # Follow-up in the same session — Genie uses prior messages for context.
+            message = client.genie.create_message_and_wait(
+                space_id=GENIE_SPACE_ID,
+                conversation_id=conversation_id,
+                content=question,
+            )
+        else:
+            # First question this session — start a fresh conversation thread.
+            # (Databricks recommends a new thread per user session rather than
+            # reusing one across sessions; Streamlit's session_state gives us that.)
+            message = client.genie.start_conversation_and_wait(
+                space_id=GENIE_SPACE_ID,
+                content=question,
+            )
+            st.session_state.genie_conversation_id = message.conversation_id
+
+        texts = [a.text.content for a in (message.attachments or []) if getattr(a, "text", None)]
+        if texts:
+            return "\n\n".join(texts), True
+        return "Genie answered but returned no text content — check the space's query attachments.", True
+    except Exception as exc:
+        # Presentation stays clean for the client; the real error goes to app logs.
+        print(f"Genie call failed: {exc}")
+        return _demo_genie_answer(question), False
+
+
+def _demo_genie_answer(question: str) -> str:
+    q = question.lower()
+    if "revenue" in q:
+        return "Today's collected revenue is SAR 45.2K across 126 patient encounters, up 8.5% on the comparable day last week."
+    if "claim" in q:
+        return "14 claims require review before submission. The highest-risk issue is a missing diagnosis on CLM-20031."
+    if "medicine" in q or "reorder" in q:
+        return "Amoxicillin 500mg is projected to reach its reorder threshold in two days. Two other items should be reviewed this week."
+    if "forecast" in q or "opd" in q:
+        return "The demand model forecasts approximately 149 OPD arrivals tomorrow, with the busiest period expected between 09:00 and 11:30."
+    return "For the production build, this question can be routed to a Unity Catalog-governed Genie space with row- and column-level access controls."
 
 
 def title(name: str, description: str) -> None:
@@ -555,18 +635,34 @@ def claim_review_details(claim_id: str, finding: str) -> dict[str, Any]:
 def assistant_page() -> None:
     title("Weqayah AI", "A governed assistant experience for operational questions. Connect this view to an approved Genie space or model-serving endpoint in production.")
     prompts = ["What is today's revenue?", "Show claims most likely to be rejected", "Which medicines need reordering?", "Forecast tomorrow's OPD arrivals"]
+
+    live = genie_ready()
+    top = st.columns([5, 1])
+    with top[0]:
+        st.markdown("**Try asking:** " + " · ".join(prompts))
+    with top[1]:
+        if st.session_state.get("genie_conversation_id") and st.button("↻ New chat", use_container_width=True):
+            st.session_state.pop("genie_conversation_id", None)
+            st.session_state.pop("genie_history", None)
+            st.rerun()
+
+    for turn in st.session_state.get("genie_history", []):
+        st.chat_message(turn["role"]).write(turn["content"])
+
     question = st.chat_input("Ask Weqayah AI about clinic operations…")
-    st.markdown("**Try asking:** " + " · ".join(prompts))
     if question:
         st.chat_message("user").write(question)
-        q = question.lower()
-        if "revenue" in q: answer = "Today's collected revenue is SAR 45.2K across 126 patient encounters, up 8.5% on the comparable day last week."
-        elif "claim" in q: answer = "14 claims require review before submission. The highest-risk issue is a missing diagnosis on CLM-20031."
-        elif "medicine" in q or "reorder" in q: answer = "Amoxicillin 500mg is projected to reach its reorder threshold in two days. Two other items should be reviewed this week."
-        elif "forecast" in q or "opd" in q: answer = "The demand model forecasts approximately 149 OPD arrivals tomorrow, with the busiest period expected between 09:00 and 11:30."
-        else: answer = "For the production build, this question can be routed to a Unity Catalog-governed Genie space with row- and column-level access controls."
+        with st.spinner("Asking Genie…" if live else "Thinking…"):
+            answer, is_live = ask_genie(question)
         st.chat_message("assistant").write(answer)
-    st.caption("Demo response mode is enabled. Do not send protected health information to an unapproved model endpoint.")
+        history = st.session_state.setdefault("genie_history", [])
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": answer})
+        if not is_live:
+            st.caption("⚠️ Answered in demo mode this turn — the live Genie call was unavailable, see below.")
+
+    mode = "Connected to Genie space — answers are live" if live else "Demo response mode — GENIE_SPACE_ID not configured or unreachable"
+    st.caption(f"● {mode}. Do not send protected health information to an unapproved model endpoint.")
 
 
 def analytics() -> None:
