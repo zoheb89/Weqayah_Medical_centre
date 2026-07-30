@@ -7,6 +7,7 @@ Set the catalog/schema/table names in app.yaml for each environment.
 from __future__ import annotations
 
 import os
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -42,11 +43,14 @@ CSS = """
 <style>
   .stApp { background: #f8fafc; color: #13243e; }
   [data-testid="stSidebar"] { background: linear-gradient(180deg,#1768aa 0%,#154f86 100%); }
+  [data-testid="stSidebar"] > div:first-child { height:100vh; overflow-y:hidden !important; }
   [data-testid="stSidebar"] * { color: #edf8ff !important; }
-  [data-testid="stSidebar"] [data-testid="stRadio"] label { border-radius:10px; padding:.43rem .5rem; margin:.08rem 0; }
+  [data-testid="stSidebar"] [data-testid="stRadio"] label { border-radius:9px; padding:.24rem .42rem; margin:.02rem 0; min-height:30px; }
+  [data-testid="stSidebar"] [data-testid="stRadio"] label p { font-size:.86rem; }
+  [data-testid="stSidebar"] [data-testid="stRadio"] { gap:0 !important; }
   [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) { background:rgba(255,255,255,.96); }
   [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) * { color:#14579b !important; font-weight:700; }
-  .brand-sub {font-size:.78rem; color:#d9ecfb; margin:.45rem 0 1.2rem;}
+  .brand-sub {font-size:.72rem; color:#d9ecfb; margin:.3rem 0 .6rem;}
   .topbar {display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #e4ebf3; background:#fff; padding:.45rem 1.15rem .55rem; margin:-1rem -1rem 1.1rem;}
   .topbar-title {font-weight:750;color:#17599d;font-size:1.05rem}.topbar-user {font-size:.85rem;color:#253858;text-align:right}.topbar-user span {color:#6c7d92;font-size:.74rem}
   .eyebrow {font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; color:#4b7087; font-weight:700;}
@@ -138,6 +142,24 @@ def demo_patients() -> pd.DataFrame:
         ["MRN-100247", "Sara Al-Salem", "F", 29, "Waiting", "NPHIES / Tawuniya", "Today, 08:52"],
         ["MRN-100248", "Fahad Al-Mutairi", "M", 61, "Lab pending", "NPHIES / Bupa", "Today, 08:31"],
     ], columns=["MRN", "Patient", "Gender", "Age", "Status", "Payer", "Last activity"])
+    # A deterministic 100-record roster keeps the presentation searchable even
+    # before the Gold patient table is connected.
+    first_names = ["Abdul Rahim", "Fatimah", "Mohammed", "Noura", "Khalid", "Reem", "Yousef", "Laila", "Saad", "Huda", "Ibrahim", "Maha"]
+    family_names = ["Al-Harbi", "Al-Qahtani", "Al-Salem", "Al-Mutairi", "Al-Rashidi", "Al-Ghamdi", "Al-Otaibi", "Al-Zahrani"]
+    statuses = ["Registered", "Active", "Waiting", "In consultation", "Lab pending"]
+    payers = ["Cash", "NPHIES / Bupa", "NPHIES / Tawuniya", "NPHIES / Medgulf"]
+    generated = []
+    for index in range(1, 97):
+        generated.append([
+            f"MRN-{731400 + index}",
+            f"{first_names[index % len(first_names)]} {family_names[index % len(family_names)]}",
+            "F" if index % 2 else "M",
+            22 + (index * 3) % 57,
+            statuses[index % len(statuses)],
+            payers[index % len(payers)],
+            f"Today, {8 + index % 5:02d}:{(index * 7) % 60:02d}",
+        ])
+    baseline = pd.concat([baseline, pd.DataFrame(generated, columns=baseline.columns)], ignore_index=True)
     additions = st.session_state.get("demo_registrations", [])
     if not additions:
         return baseline
@@ -294,18 +316,51 @@ def patient_search() -> None:
         st.divider()
         st.write(f"**Latest activity**  \n{patient.get('Last activity', patient.get('last_activity', 'No recent activity'))}")
         st.write("**Clinical alert**  \nNo known allergies")
-        if st.button("Open patient record", type="primary", use_container_width=True):
-            st.session_state.open_patient_profile = True
-            st.session_state.selected_patient = patient
-            st.session_state.navigation = "Patient Profile"
-            st.rerun()
+        st.button(
+            "Open patient record",
+            type="primary",
+            use_container_width=True,
+            on_click=open_patient_profile,
+            args=(patient,),
+        )
         st.button("Register new visit", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
+def open_patient_profile(patient: dict[str, Any]) -> None:
+    """Callback: update navigation before the sidebar radio is instantiated."""
+    st.session_state.open_patient_profile = True
+    st.session_state.selected_patient = patient
+    st.session_state.navigation = "Patient Profile"
+
+
 def patient_profile() -> None:
     title("Patient profile", "A longitudinal patient view combining demographics, active visit, clinical history, orders, billing and insurance activity.")
-    patient = st.session_state.get("selected_patient", demo_patients().iloc[0].to_dict())
+    source = live_or_demo("patients", demo_patients())
+    profile_search, _ = st.columns([1.25, .75])
+    with profile_search:
+        search = st.text_input("Find a patient", placeholder="Search by MRN, name, National ID, or mobile number", key="patient_profile_search")
+    if search:
+        candidates = source[source.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)]
+    else:
+        candidates = source
+    if candidates.empty:
+        st.warning("No patient matches your search. Try a name or MRN.")
+        return
+    labels = [
+        f"{row.get('Patient', row.get('patient_name', 'Patient'))} · {row.get('MRN', row.get('mrn', '—'))}"
+        for _, row in candidates.iterrows()
+    ]
+    current = st.session_state.get("selected_patient", {})
+    current_label = f"{current.get('Patient', current.get('patient_name', ''))} · {current.get('MRN', current.get('mrn', ''))}"
+    selected_label = st.selectbox(
+        "Select patient",
+        labels,
+        index=labels.index(current_label) if current_label in labels else 0,
+        help="The profile below refreshes when a patient is selected.",
+    )
+    patient = candidates.iloc[labels.index(selected_label)].to_dict()
+    st.session_state.selected_patient = patient
     name = patient.get("Patient", patient.get("patient_name", "Selected patient"))
     mrn = patient.get("MRN", patient.get("mrn", "—"))
     payer = patient.get("Payer", patient.get("payer", "Not captured"))
@@ -378,11 +433,45 @@ def lab() -> None:
 
 def radiology() -> None:
     title("Radiology worklist", "A unified worklist for orders, PACS study status, reporting and clinician delivery.")
-    worklist = pd.DataFrame([["RAD-9921", "Sara Al-Salem", "Chest X-ray", "Acquired", "Dr. Noor", "Routine"], ["RAD-9922", "Omar Al-Qahtani", "Knee X-ray", "Scheduled", "—", "Routine"], ["RAD-9923", "Fahad Al-Mutairi", "CT Head", "Reporting", "Dr. Noor", "Urgent"]], columns=["Order", "Patient", "Study", "Status", "Radiologist", "Priority"])
-    st.dataframe(worklist, use_container_width=True, hide_index=True)
+    a, b, c, d = st.columns(4)
+    with a: metric("PACS connection", "Connected", "DICOM listener healthy")
+    with b: metric("Studies today", "38", "7 received this hour")
+    with c: metric("Awaiting report", "5", "1 urgent")
+    with d: metric("Last message", "Just now", "Study received")
+    st.caption("Live demo feed — refreshes every five seconds. Replace `pacs_demo_worklist()` with the clinic-approved DICOM/PACS connector for production.")
+    pacs_live_worklist()
     a, b = st.columns([1, 1.6])
     with a: st.metric("Turnaround time", "37 min", "Target < 60 min")
-    with b: st.info("PACS interface status: connected. Production integration should use the clinic’s approved DICOM/PACS interface, rather than manual image uploads.")
+    with b:
+        st.success("PACS interface status: connected")
+        st.write("New imaging studies are appearing in the worklist and can move from acquisition to reporting and release. Production integration will use the clinic-approved DICOM/PACS interface.")
+
+
+def pacs_demo_worklist() -> pd.DataFrame:
+    """Return a time-aware PACS feed for the client demonstration.
+
+    It intentionally uses no simulated clinical image data. The production version
+    replaces this with approved DICOM/PACS metadata only.
+    """
+    refreshed = st.session_state.get("pacs_refresh_at", time.time())
+    seconds_since_refresh = int(time.time() - refreshed)
+    incoming_status = "Received" if seconds_since_refresh < 20 else "Queued"
+    worklist = [
+        ["RAD-9921", "Sara Al-Salem", "Chest X-ray", "Acquired", "Dr. Noor", "Routine", "09:42:18"],
+        ["RAD-9922", "Omar Al-Qahtani", "Knee X-ray", "Scheduled", "—", "Routine", "09:37:01"],
+        ["RAD-9923", "Fahad Al-Mutairi", "CT Head", "Reporting", "Dr. Noor", "Urgent", "09:31:44"],
+        ["RAD-9924", "Maha Al-Ghamdi", "Ultrasound abdomen", incoming_status, "Dr. Noor", "Routine", time.strftime("%H:%M:%S")],
+    ]
+    return pd.DataFrame(worklist, columns=["Order", "Patient", "Study", "PACS status", "Radiologist", "Priority", "Last event"])
+
+
+@st.fragment(run_every="5s")
+def pacs_live_worklist() -> None:
+    """Refresh only the PACS worklist, keeping the rest of the screen stable."""
+    if st.button("↻ Refresh PACS worklist"):
+        st.session_state.pacs_refresh_at = time.time()
+    st.dataframe(pacs_demo_worklist(), use_container_width=True, hide_index=True)
+    st.caption(f"Last refreshed: {time.strftime('%H:%M:%S')} · Live simulation active")
 
 
 def pharmacy() -> None:
@@ -408,16 +497,59 @@ def billing() -> None:
 
 def claims() -> None:
     title("Insurance claims workbench", "Prioritise NPHIES submissions using eligibility, completeness, and denial-risk signals.")
-    claims_demo = pd.DataFrame([["CLM-20031", "NPHIES / Bupa", "SAR 1,120", "82", "Diagnosis missing", "Review before submit"], ["CLM-20032", "NPHIES / Tawuniya", "SAR 580", "21", "Complete", "Ready to submit"], ["CLM-20033", "NPHIES / Medgulf", "SAR 2,940", "74", "Potential duplicate", "Investigate"]], columns=["Claim", "Payer", "Amount", "Risk score", "AI finding", "Next action"])
+    claims_demo = demo_claims()
     claims_data = live_or_demo("claims", claims_demo)
     st.markdown("<div class='alert'><b>AI claim guard:</b> 14 claims need attention before submission. Review the highest risk cases first to reduce avoidable rejections.</div>", unsafe_allow_html=True)
-    st.dataframe(claims_data, use_container_width=True, hide_index=True)
-    with st.expander("Claim review: CLM-20031", expanded=True):
+    search = st.text_input("Find claim", placeholder="Claim number, payer, finding, or status", key="claim_search")
+    if search:
+        candidates = claims_data[claims_data.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)]
+    else:
+        candidates = claims_data
+    if candidates.empty:
+        st.info("No claims match this search.")
+        return
+    st.dataframe(candidates, use_container_width=True, hide_index=True)
+    claim_column = "Claim" if "Claim" in candidates.columns else candidates.columns[0]
+    selected_claim = st.selectbox("Select claim for review", candidates[claim_column].astype(str).tolist(), key="selected_claim")
+    claim = candidates[candidates[claim_column].astype(str) == selected_claim].iloc[0].to_dict()
+    finding = claim.get("AI finding", claim.get("ai_finding", "Review required"))
+    details = claim_review_details(selected_claim, finding)
+    with st.expander(f"Claim review: {selected_claim}", expanded=True):
         a, b = st.columns([1.2, 1])
-        with a: st.write("**Finding:** No billable diagnosis is mapped to one service line.\n\n**Recommendation:** Add ICD-10 diagnosis and confirm payer eligibility before submitting.")
+        with a: st.write(f"**Finding:** {details['finding']}\n\n**Recommendation:** {details['recommendation']}")
         with b:
-            st.selectbox("Resolution", ["Request clinician completion", "Override with justification", "Return to billing"])
-            st.button("Record review action", type="primary")
+            resolution = st.selectbox("Resolution", details["resolutions"], key=f"resolution_{selected_claim}")
+            if st.button("Record review action", type="primary", key=f"review_{selected_claim}"):
+                st.session_state.setdefault("claim_review_actions", {})[selected_claim] = resolution
+                st.success(f"Review action recorded for {selected_claim}: {resolution}")
+
+
+def demo_claims() -> pd.DataFrame:
+    base = [
+        ["CLM-20031", "NPHIES / Bupa", "SAR 1,120", "82", "Diagnosis missing", "Review before submit"],
+        ["CLM-20032", "NPHIES / Tawuniya", "SAR 580", "21", "Complete", "Ready to submit"],
+        ["CLM-20033", "NPHIES / Medgulf", "SAR 2,940", "74", "Potential duplicate", "Investigate"],
+    ]
+    findings = ["Eligibility needs confirmation", "Coding mismatch", "Supporting document missing", "Complete"]
+    payers = ["NPHIES / Bupa", "NPHIES / Tawuniya", "NPHIES / Medgulf", "NPHIES / CCHI"]
+    for number in range(20034, 20061):
+        finding = findings[number % len(findings)]
+        base.append([f"CLM-{number}", payers[number % len(payers)], f"SAR {450 + (number * 37) % 3200:,}", str(14 + (number * 9) % 78), finding, "Ready to submit" if finding == "Complete" else "Review before submit"])
+    return pd.DataFrame(base, columns=["Claim", "Payer", "Amount", "Risk score", "AI finding", "Next action"])
+
+
+def claim_review_details(claim_id: str, finding: str) -> dict[str, Any]:
+    if "duplicate" in finding.lower():
+        return {"finding": "A potentially duplicate submission was identified for the same patient, service date, and payer.", "recommendation": "Compare the earlier claim and retain only the valid service line before resubmitting.", "resolutions": ["Investigate duplicate", "Return to billing", "Override with justification"]}
+    if "eligibility" in finding.lower():
+        return {"finding": "Payer eligibility could not be confirmed for the service date.", "recommendation": "Run eligibility verification and update coverage details before submission.", "resolutions": ["Verify eligibility", "Return to registration", "Override with justification"]}
+    if "coding" in finding.lower():
+        return {"finding": "A procedure or diagnosis coding mismatch was detected.", "recommendation": "Review the ICD-10 and service coding with the clinical and billing teams.", "resolutions": ["Request coding review", "Return to billing", "Override with justification"]}
+    if "document" in finding.lower():
+        return {"finding": "A required supporting document is missing from the claim package.", "recommendation": "Attach the supporting clinical document before submitting to the payer.", "resolutions": ["Request document", "Return to clinical team", "Override with justification"]}
+    if "complete" in finding.lower():
+        return {"finding": "No material completeness issue was identified by the claim guard.", "recommendation": "Confirm the final charge amount and submit the claim through the approved NPHIES workflow.", "resolutions": ["Submit to NPHIES", "Hold for review", "Return to billing"]}
+    return {"finding": "No billable diagnosis is mapped to one service line.", "recommendation": "Add the ICD-10 diagnosis and confirm payer eligibility before submitting.", "resolutions": ["Request clinician completion", "Override with justification", "Return to billing"]}
 
 
 def assistant_page() -> None:
@@ -475,7 +607,7 @@ PAGES = {
 def main() -> None:
     with st.sidebar:
         if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), use_container_width=True)
+            st.image(str(LOGO_PATH), width=225)
         else:
             st.markdown("### Weqayah\nMedical Center")
         st.markdown('<div class="brand-sub">AI-Powered Hospital Information System</div>', unsafe_allow_html=True)
