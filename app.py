@@ -179,6 +179,46 @@ def live_or_demo(key: str, demo: pd.DataFrame, limit: int = 100) -> pd.DataFrame
     return frame if not frame.empty else demo
 
 
+def live_registrations(limit: int = 100) -> pd.DataFrame:
+    """Patients written via the Registration form, read straight back from the
+    Lakebase write table — shown immediately rather than waiting on a Gold-layer
+    ETL pipeline (Bronze -> Silver -> Gold) that hasn't been built yet. Columns
+    are shaped to match demo_patients()/the Gold read model so this can be
+    combined with either and rendered by the same existing UI code.
+    """
+    return query(f"""
+        SELECT
+          mrn AS MRN,
+          concat_ws(' ', first_name, last_name) AS Patient,
+          left(gender, 1) AS Gender,
+          (year(current_date()) - year(date_of_birth)) AS Age,
+          'Registered' AS Status,
+          payer AS Payer,
+          national_id AS `National ID`,
+          phone AS Mobile,
+          date_format(created_at, 'MMM d, HH:mm') AS `Last activity`
+        FROM {sql_identifier(WRITE_TABLE)}
+        ORDER BY created_at DESC
+        LIMIT {limit}
+    """)
+
+
+def combined_patients(limit: int = 100) -> pd.DataFrame:
+    """Live registrations first (most recent on top), then the Gold read model
+    or demo fallback — so a patient registered seconds ago is searchable
+    immediately, without depending on a sync job that doesn't exist yet.
+    """
+    live = live_registrations(limit)
+    rest = live_or_demo("patients", demo_patients())
+    frames = [f for f in (live, rest) if not f.empty]
+    if not frames:
+        return demo_patients()
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    if "MRN" in combined.columns:
+        combined = combined.drop_duplicates(subset="MRN", keep="first")
+    return combined
+
+
 def genie_client() -> Optional["WorkspaceClient"]:
     """Return a cached WorkspaceClient for Genie calls, or None if unavailable.
 
@@ -346,7 +386,7 @@ def registration() -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("Recent registrations")
-        st.dataframe(demo_patients().loc[:, ["MRN", "Patient", "Status"]], use_container_width=True, hide_index=True, height=230)
+        st.dataframe(combined_patients().loc[:, ["MRN", "Patient", "Status"]], use_container_width=True, hide_index=True, height=230)
         st.button("View all registrations", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
         a, b, c = st.columns(3)
@@ -360,7 +400,7 @@ def patient_search() -> None:
     left, right = st.columns([1.4, .75])
     with left:
         search = st.text_input("Search patient", placeholder="MRN, National ID / Iqama, mobile number, or patient name")
-        source = live_or_demo("patients", demo_patients())
+        source = combined_patients()
         if search:
             matches = source[source.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)]
         else:
@@ -416,7 +456,7 @@ def open_patient_profile(patient: dict[str, Any]) -> None:
 
 def patient_profile() -> None:
     title("Patient profile", "A longitudinal patient view combining demographics, active visit, clinical history, orders, billing and insurance activity.")
-    source = live_or_demo("patients", demo_patients())
+    source = combined_patients()
     profile_search, _ = st.columns([1.25, .75])
     with profile_search:
         search = st.text_input("Find a patient", placeholder="Search by MRN, name, National ID, or mobile number", key="patient_profile_search")
