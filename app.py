@@ -263,31 +263,63 @@ def patient_search() -> None:
             matches = source[source.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)]
         else:
             matches = source
-        st.dataframe(matches, use_container_width=True, hide_index=True, height=310)
+        selection = st.dataframe(
+            matches,
+            use_container_width=True,
+            hide_index=True,
+            height=310,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="patient_search_grid",
+        )
+        selected_rows = selection.selection.rows
+        if selected_rows:
+            st.session_state.selected_patient = matches.iloc[selected_rows[0]].to_dict()
+        st.caption("Select a patient row to update the profile panel.")
     with right:
+        patient = st.session_state.get("selected_patient")
+        if patient is None and not matches.empty:
+            patient = matches.iloc[0].to_dict()
+        if patient is None:
+            st.info("No patients match this search.")
+            return
+        name = patient.get("Patient", patient.get("patient_name", "Selected patient"))
+        mrn = patient.get("MRN", patient.get("mrn", "—"))
+        payer = patient.get("Payer", patient.get("payer", "Not captured"))
+        status = patient.get("Status", patient.get("status", "Active"))
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("Patient profile")
-        st.write("**Ahmed Alqahtani**  \nMRN100245 · Active")
-        st.caption("National ID verified · NPHIES / Bupa")
+        st.write(f"**{name}**  \n{mrn} · {status}")
+        st.caption(f"National ID verified · {payer}")
         st.divider()
-        st.write("**Latest visit**  \nGeneral Medicine · Today, 10:42 AM")
+        st.write(f"**Latest activity**  \n{patient.get('Last activity', patient.get('last_activity', 'No recent activity'))}")
         st.write("**Clinical alert**  \nNo known allergies")
         if st.button("Open patient record", type="primary", use_container_width=True):
             st.session_state.open_patient_profile = True
+            st.session_state.selected_patient = patient
+            st.session_state.navigation = "Patient Profile"
+            st.rerun()
         st.button("Register new visit", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
 def patient_profile() -> None:
     title("Patient profile", "A longitudinal patient view combining demographics, active visit, clinical history, orders, billing and insurance activity.")
+    patient = st.session_state.get("selected_patient", demo_patients().iloc[0].to_dict())
+    name = patient.get("Patient", patient.get("patient_name", "Selected patient"))
+    mrn = patient.get("MRN", patient.get("mrn", "—"))
+    payer = patient.get("Payer", patient.get("payer", "Not captured"))
+    status = patient.get("Status", patient.get("status", "Active"))
+    gender = patient.get("Gender", patient.get("gender", "—"))
+    age = patient.get("Age", patient.get("age", "—"))
     a, b = st.columns([1.25, .75])
     with a:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.subheader("Ahmed Alqahtani  ·  MRN100245")
-        st.caption("Male · 37 years · National ID verified · NPHIES / Bupa")
+        st.subheader(f"{name}  ·  {mrn}")
+        st.caption(f"{gender} · {age} years · National ID verified · {payer}")
         x, y, z = st.columns(3)
-        x.metric("Active visit", "General Medicine")
-        y.metric("Last visit", "Today, 10:42 AM")
+        x.metric("Patient status", status)
+        y.metric("Last activity", patient.get("Last activity", patient.get("last_activity", "—")))
         z.metric("Outstanding", "SAR 0")
         st.markdown("</div>", unsafe_allow_html=True)
         tabs = st.tabs(["Timeline", "Clinical", "Orders", "Billing & claims"])
@@ -447,7 +479,7 @@ def main() -> None:
         else:
             st.markdown("### Weqayah\nMedical Center")
         st.markdown('<div class="brand-sub">AI-Powered Hospital Information System</div>', unsafe_allow_html=True)
-        page = st.radio("Navigate", list(PAGES), label_visibility="collapsed")
+        page = st.radio("Navigate", list(PAGES), label_visibility="collapsed", key="navigation")
         st.divider()
         mode = "Connected to Databricks SQL" if db_ready() else "Presentation mode"
         st.caption(f"● {mode}")
