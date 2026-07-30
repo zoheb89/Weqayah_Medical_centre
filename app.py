@@ -179,6 +179,56 @@ def live_or_demo(key: str, demo: pd.DataFrame, limit: int = 100) -> pd.DataFrame
     return frame if not frame.empty else demo
 
 
+PATIENT_COLUMN_ALIASES: dict[str, list[str]] = {
+    "MRN": ["mrn", "patient_mrn", "medical_record_number"],
+    "Patient": ["patient", "patient_name", "full_name", "name"],
+    "Gender": ["gender", "sex"],
+    "Age": ["age", "patient_age"],
+    "Status": ["status", "patient_status", "visit_status"],
+    "Payer": ["payer", "payer_name", "insurance", "coverage"],
+    "National ID": ["national id", "national_id", "iqama", "id_number"],
+    "Mobile": ["mobile", "phone", "mobile_number", "contact_number"],
+    "Last activity": ["last activity", "last_activity", "last_visit", "updated_at"],
+}
+
+
+def normalize_patient_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Coerce an arbitrarily-shaped patient frame (e.g. a raw Gold table read
+    with production column names) onto the canonical schema the UI renders.
+
+    Without this, a `SELECT *` against a differently-named source table would
+    get stacked onto the app's expected columns via pd.concat, producing rows
+    that are entirely NaN in "MRN"/"Patient" — and worse, drop_duplicates on a
+    NaN "MRN" collapses *all* such rows down to a single row, which is exactly
+    how a full existing roster can appear to "disappear" after one real
+    registration lands. Renaming known aliases and dropping rows that still
+    have no identifiable MRN/Patient keeps garbage rows out entirely instead
+    of letting them masquerade as blank records.
+    """
+    if frame.empty:
+        return frame
+    lookup = {str(col).strip().lower(): col for col in frame.columns}
+    rename_map: dict[str, str] = {}
+    for canonical, aliases in PATIENT_COLUMN_ALIASES.items():
+        if canonical in frame.columns:
+            continue
+        for alias in aliases:
+            if alias in lookup:
+                rename_map[lookup[alias]] = canonical
+                break
+    normalized = frame.rename(columns=rename_map)
+    for canonical in PATIENT_COLUMN_ALIASES:
+        if canonical not in normalized.columns:
+            normalized[canonical] = pd.NA
+    ordered = list(PATIENT_COLUMN_ALIASES) + [c for c in normalized.columns if c not in PATIENT_COLUMN_ALIASES]
+    normalized = normalized[ordered]
+    # Drop rows with no usable identity — these are schema-mismatch artifacts,
+    # not real patients, and must not be allowed to survive into the UI or
+    # into drop_duplicates() below.
+    has_identity = normalized["MRN"].notna() & (normalized["MRN"].astype(str).str.strip() != "")
+    return normalized[has_identity].reset_index(drop=True)
+
+
 def live_registrations(limit: int = 100) -> pd.DataFrame:
     """Patients written via the Registration form, read straight back from the
     Lakebase write table — shown immediately rather than waiting on a Gold-layer
@@ -207,15 +257,27 @@ def combined_patients(limit: int = 100) -> pd.DataFrame:
     """Live registrations first (most recent on top), then the Gold read model
     or demo fallback — so a patient registered seconds ago is searchable
     immediately, without depending on a sync job that doesn't exist yet.
+
+    Both sources are normalized onto the same canonical columns before being
+    combined. This is what keeps a brand-new registration from ever *replacing*
+    the existing roster: a schema mismatch on the Gold side now just gets
+    filtered out (see normalize_patient_frame), instead of surviving as blank
+    rows that then collapse the rest of the roster during de-duplication.
     """
-    live = live_registrations(limit)
-    rest = live_or_demo("patients", demo_patients())
+    live = normalize_patient_frame(live_registrations(limit))
+    demo = demo_patients()
+    rest = normalize_patient_frame(live_or_demo("patients", demo))
+    if rest.empty:
+        # Gold read produced nothing usable (empty table, permissions error,
+        # or a schema that didn't match) — always fall back to the full demo
+        # roster rather than showing only the live registrations.
+        rest = normalize_patient_frame(demo)
     frames = [f for f in (live, rest) if not f.empty]
     if not frames:
-        return demo_patients()
+        return demo
     combined = pd.concat(frames, ignore_index=True, sort=False)
-    if "MRN" in combined.columns:
-        combined = combined.drop_duplicates(subset="MRN", keep="first")
+    combined = combined[combined["MRN"].notna() & (combined["MRN"].astype(str).str.strip() != "")]
+    combined = combined.drop_duplicates(subset="MRN", keep="first").reset_index(drop=True)
     return combined
 
 
@@ -330,8 +392,47 @@ def dashboard() -> None:
     st.dataframe(demo_patients(), use_container_width=True, hide_index=True)
 
 
-def registration() -> None:
-    title("Patient registration", "Create a patient record and visit. Writes are routed to the governed Lakebase operational table.")
+def patient_hub() -> None:
+    """Single page hosting Registration, Search, and Profile as one workflow.
+
+    These three used to be separate top-level sidebar pages. Each one called
+    combined_patients() independently and jumped between pages by mutating
+    st.session_state.navigation, which meant selection state, search state,
+    and the underlying roster could all disagree with each other across a
+    page swap. Keeping them as sub-views of one page means there is exactly
+    one shared session_state.selected_patient and one place that computes the
+    roster, so registering a patient, finding them, and opening their profile
+    is one continuous flow instead of three independently-rendered pages.
+    """
+    title("Patient Registration & Search", "Register a patient and visit, search the full roster, and open a longitudinal patient profile — all in one workspace.")
+    st.radio(
+        "Section",
+        ["Register", "Search", "Profile"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="patient_subview",
+    )
+    st.divider()
+    view = st.session_state.get("patient_subview", "Register")
+    if view == "Register":
+        _patient_registration_view()
+    elif view == "Search":
+        _patient_search_view()
+    else:
+        _patient_profile_view()
+
+
+def _go_to_subview(view: str, patient: Optional[dict[str, Any]] = None) -> None:
+    """Callback: set the sub-view (and optionally the selected patient) before
+    the patient_subview radio is instantiated on the next rerun — mirrors the
+    existing sidebar-navigation callback pattern used elsewhere in this app.
+    """
+    st.session_state.patient_subview = view
+    if patient is not None:
+        st.session_state.selected_patient = patient
+
+
+def _patient_registration_view() -> None:
     c1, c2 = st.columns([1.25, .82])
     with c1:
         if st.session_state.get("registration_success"):
@@ -387,7 +488,7 @@ def registration() -> None:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("Recent registrations")
         st.dataframe(combined_patients().loc[:, ["MRN", "Patient", "Status"]], use_container_width=True, hide_index=True, height=230)
-        st.button("View all registrations", use_container_width=True)
+        st.button("View all registrations", use_container_width=True, on_click=_go_to_subview, args=("Search",))
         st.markdown("</div>", unsafe_allow_html=True)
         a, b, c = st.columns(3)
         a.button("Print slip", use_container_width=True)
@@ -395,8 +496,8 @@ def registration() -> None:
         c.button("Start consultation", use_container_width=True)
 
 
-def patient_search() -> None:
-    title("Patient search", "Find a patient by MRN, National ID, Iqama, mobile number, or name, then open their clinical and financial timeline.")
+def _patient_search_view() -> None:
+    st.caption("Find a patient by MRN, National ID, Iqama, mobile number, or name, then open their clinical and financial timeline.")
     left, right = st.columns([1.4, .75])
     with left:
         search = st.text_input("Search patient", placeholder="MRN, National ID / Iqama, mobile number, or patient name")
@@ -440,22 +541,15 @@ def patient_search() -> None:
             "Open patient record",
             type="primary",
             use_container_width=True,
-            on_click=open_patient_profile,
-            args=(patient,),
+            on_click=_go_to_subview,
+            args=("Profile", patient),
         )
-        st.button("Register new visit", use_container_width=True)
+        st.button("Register new visit", use_container_width=True, on_click=_go_to_subview, args=("Register",))
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-def open_patient_profile(patient: dict[str, Any]) -> None:
-    """Callback: update navigation before the sidebar radio is instantiated."""
-    st.session_state.open_patient_profile = True
-    st.session_state.selected_patient = patient
-    st.session_state.navigation = "Patient Profile"
-
-
-def patient_profile() -> None:
-    title("Patient profile", "A longitudinal patient view combining demographics, active visit, clinical history, orders, billing and insurance activity.")
+def _patient_profile_view() -> None:
+    st.caption("A longitudinal patient view combining demographics, active visit, clinical history, orders, billing and insurance activity.")
     source = combined_patients()
     profile_search, _ = st.columns([1.25, .75])
     with profile_search:
@@ -733,7 +827,7 @@ def administration() -> None:
 
 
 PAGES = {
-    "Command Center": dashboard, "Patient Registration": registration, "Patient Search": patient_search, "Patient Profile": patient_profile, "Clinical / EMR": emr,
+    "Command Center": dashboard, "Patient Registration & Search": patient_hub, "Clinical / EMR": emr,
     "Laboratory": lab, "Radiology": radiology, "Pharmacy": pharmacy, "Billing": billing,
     "Insurance": claims, "Weqayah AI": assistant_page, "Executive Analytics": analytics,
     "Administration": administration,
