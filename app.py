@@ -174,9 +174,25 @@ def safe_table(key: str) -> str:
     return sql_identifier(TABLES[key])
 
 
-def live_or_demo(key: str, demo: pd.DataFrame, limit: int = 100) -> pd.DataFrame:
+def live_or_demo(key: str, demo: pd.DataFrame, limit: int = 100, required_columns: Optional[list[str]] = None) -> pd.DataFrame:
+    """Read a Gold table, or fall back to the demo shape.
+
+    A non-empty result isn't automatically usable: this does a blind
+    `SELECT *`, and a real Gold table can exist with a different column
+    schema than this app's demo data (production `fact_claims` did — no
+    "Amount" column — which crashed the Insurance page with a KeyError deep
+    inside the rendering code, the same class of problem normalize_patient_frame
+    fixes for the patient roster). When required_columns is given, a live
+    result missing any of them is treated the same as an empty result: fall
+    back to demo rather than handing mismatched data to code that assumes a
+    specific schema.
+    """
     frame = query(f"SELECT * FROM {safe_table(key)} LIMIT {limit}")
-    return frame if not frame.empty else demo
+    if frame.empty:
+        return demo
+    if required_columns and not all(col in frame.columns for col in required_columns):
+        return demo
+    return frame
 
 
 PATIENT_COLUMN_ALIASES: dict[str, list[str]] = {
@@ -827,7 +843,7 @@ def pacs_live_worklist() -> None:
 def pharmacy() -> None:
     title("Pharmacy and inventory", "Dispense safely, see prescription queues, and act on Lakehouse-driven replenishment recommendations.")
     inventory_demo = pd.DataFrame([["Amoxicillin 500mg", 85, 140, "Reorder in 2 days", "Urgent"], ["Paracetamol 500mg", 420, 250, "Healthy", "Normal"], ["Metformin 500mg", 110, 160, "Reorder in 5 days", "Review"]], columns=["Item", "On hand", "Reorder point", "AI recommendation", "Priority"])
-    inventory = live_or_demo("inventory", inventory_demo)
+    inventory = live_or_demo("inventory", inventory_demo, required_columns=["Item", "On hand", "Reorder point", "AI recommendation", "Priority"])
     a, b, c = st.columns(3)
     with a: metric("Dispense queue", "11", "3 waiting > 15 min")
     with b: metric("Low-stock items", "6", "2 urgent")
@@ -950,7 +966,7 @@ def billing() -> None:
 def claims() -> None:
     title("Insurance claims workbench", "Prioritise NPHIES submissions using eligibility, completeness, and denial-risk signals.")
     claims_demo = demo_claims()
-    claims_data = live_or_demo("claims", claims_demo)
+    claims_data = live_or_demo("claims", claims_demo, required_columns=["Claim", "Payer", "Amount", "Risk score", "AI finding", "Next action"])
     st.markdown("<div class='alert'><b>AI claim guard:</b> 14 claims need attention before submission. Review the highest risk cases first to reduce avoidable rejections.</div>", unsafe_allow_html=True)
 
     tab1, tab2, tab3 = st.tabs(["Claim queue", "Payer rollups", "Denial trend"])
