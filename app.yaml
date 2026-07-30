@@ -2,7 +2,9 @@ command: ['streamlit', 'run', 'app.py']
 env:
   # Replace with the deployed SQL warehouse resource or its warehouse ID.
   - name: DATABRICKS_WAREHOUSE_ID
-    value: 'REPLACE_WITH_SQL_WAREHOUSE_ID'
+    value: '7a36483ce8aa88ea'
+  - name: GENIE_SPACE_ID
+    value: '01f18c03f65313f4b08806f1ed6a9a9e'
   - name: MERIDIAN_CATALOG
     value: 'meridian'
   - name: MERIDIAN_GOLD_SCHEMA
