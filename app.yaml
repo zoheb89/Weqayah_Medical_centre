@@ -1,0 +1,14 @@
+command: ['streamlit', 'run', 'app.py']
+env:
+  # Replace with the deployed SQL warehouse resource or its warehouse ID.
+  - name: DATABRICKS_WAREHOUSE_ID
+    value: 'REPLACE_WITH_SQL_WAREHOUSE_ID'
+  - name: MERIDIAN_CATALOG
+    value: 'meridian'
+  - name: MERIDIAN_GOLD_SCHEMA
+    value: 'gold'
+  # Gold is read-only. This must point to an approved Lakebase/operational table.
+  - name: MERIDIAN_WRITE_TABLE
+    value: 'meridian.lakebase.patient_registration'
+  - name: STREAMLIT_GATHER_USAGE_STATS
+    value: 'false'
