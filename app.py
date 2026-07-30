@@ -379,7 +379,20 @@ def dashboard() -> None:
     with left:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.subheader("Patient flow and revenue")
-        st.line_chart(sample_trend(), color=["#0e7490", "#34a0a4"])
+        trend = sample_trend()
+        # Visits (~tens) and Revenue (~tens of thousands) sit on wildly
+        # different scales. Plotted on one axis, revenue swamps visits and
+        # the chart flattens into an unreadable line hugging the bottom —
+        # this is also why "view as table" on that combined chart looked
+        # like a wall of melted color/value rows. Two compact charts, one
+        # per scale, read cleanly at a glance.
+        vc, rc = st.columns(2)
+        with vc:
+            st.caption("Visits (7 days)")
+            st.line_chart(trend[["Visits"]], color=["#0e7490"], height=200)
+        with rc:
+            st.caption("Revenue, SAR (7 days)")
+            st.bar_chart(trend[["Revenue (SAR)"]], color=["#34a0a4"], height=200)
         st.markdown("</div>", unsafe_allow_html=True)
     with right:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -388,8 +401,31 @@ def dashboard() -> None:
         st.markdown('<div class="alert"><b>Pharmacy:</b> Amoxicillin 500mg is projected to reach reorder point in 2 days.</div>', unsafe_allow_html=True)
         st.markdown('<div class="alert"><b>Capacity:</b> Forecast shows an 18% increase in OPD arrivals tomorrow morning.</div>', unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
-    st.subheader("Current patient queue")
-    st.dataframe(demo_patients(), use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    queue_header, queue_action = st.columns([3, 1])
+    with queue_header:
+        st.subheader("Current patient queue")
+    queue = demo_patients()
+    with queue_action:
+        st.caption(f"{len(queue)} in roster")
+    # A full 100-row dump here duplicates Patient Search and dominates the
+    # page. Show a compact top slice and send anyone who needs the rest to
+    # the dedicated Search tab instead of scrolling a giant table.
+    st.dataframe(queue.head(8), use_container_width=True, hide_index=True, height=250)
+    st.button("Open full patient roster in Patient Search →", on_click=_go_to_patient_search)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _go_to_patient_search() -> None:
+    """Callback: set the destination page/sub-view before the sidebar radio
+    (key="navigation") is instantiated on the next rerun. Assigning these
+    session_state keys directly inside the page body (after the radio has
+    already rendered this run) raises a StreamlitAPIException — the callback
+    runs between reruns, which is the only safe place to do it.
+    """
+    st.session_state.navigation = "Patient Registration & Search"
+    st.session_state.patient_subview = "Search"
 
 
 def patient_hub() -> None:
@@ -435,8 +471,13 @@ def _go_to_subview(view: str, patient: Optional[dict[str, Any]] = None) -> None:
 def _patient_registration_view() -> None:
     c1, c2 = st.columns([1.25, .82])
     with c1:
-        if st.session_state.get("registration_success"):
-            st.success(f"Patient registered successfully!  MRN: {st.session_state.registration_success}")
+        # pop (not get): this is a one-shot flash message for the rerun that
+        # immediately follows a successful submit. Leaving it in session_state
+        # made it reappear every time this tab was revisited, even minutes
+        # and page-switches later, showing a stale MRN as if it just happened.
+        just_registered = st.session_state.pop("registration_success", None)
+        if just_registered:
+            st.success(f"Patient registered successfully!  MRN: {just_registered}")
         with st.form("patient_registration", clear_on_submit=True):
             st.markdown("#### Identity and contact")
             a, b, c = st.columns(3)
@@ -610,8 +651,29 @@ def _patient_profile_view() -> None:
 
 def emr() -> None:
     title("Clinical workspace", "A focused physician view for consultation, clinical notes, orders, and longitudinal patient context.")
-    patient = st.selectbox("Patient", demo_patients()["Patient"].tolist())
-    st.caption(f"MRN-100246 · {patient} · Active visit · General Medicine")
+    # Previously this selectbox always defaulted to the first demo name
+    # (Amina Al-Harbi) and the caption hardcoded "MRN-100246" no matter who
+    # was picked. It also only listed demo names, not real registrations,
+    # and duplicate names (several "Abdul Rahim" entries) were ambiguous.
+    # Sourcing from the full roster with an "MRN" suffix and no default
+    # selection makes this an actual search rather than a static picker.
+    source = combined_patients()
+    labels = [f"{row.get('Patient', 'Patient')} · {row.get('MRN', '—')}" for _, row in source.iterrows()]
+    label_to_patient = dict(zip(labels, source.to_dict("records")))
+    selected_label = st.selectbox(
+        "Patient",
+        labels,
+        index=None,
+        placeholder="Search by patient name or MRN…",
+        key="emr_patient_search",
+    )
+    if not selected_label:
+        st.info("Search for a patient above to open their clinical workspace.")
+        return
+    patient = label_to_patient[selected_label]
+    name = patient.get("Patient", "Selected patient")
+    mrn = patient.get("MRN", "—")
+    st.caption(f"{mrn} · {name} · Active visit · General Medicine")
     tabs = st.tabs(["Consultation", "Vitals", "Medication", "Lab orders", "Radiology", "History"])
     with tabs[0]:
         a, b = st.columns(2)
@@ -629,20 +691,94 @@ def emr() -> None:
     with tabs[5]: st.dataframe(pd.DataFrame([["19 Jul 2026", "General Medicine", "Hypertension follow-up"], ["04 Apr 2026", "Laboratory", "Routine blood work"]], columns=["Date", "Service", "Summary"]), use_container_width=True, hide_index=True)
 
 
+LAB_STATUS_FLOW = ["Ordered", "Collected", "In analyser", "Awaiting validation", "Validated & released"]
+
+
+def lab_orders_state() -> list[dict[str, Any]]:
+    """Session-backed lab worklist so the order composer and status actions
+    below actually persist across reruns, instead of the previous static
+    DataFrame that was rebuilt from scratch (and silently discarded any
+    change) on every page load.
+    """
+    if "lab_orders" not in st.session_state:
+        st.session_state.lab_orders = [
+            {"Order": "LAB-62241", "Patient": "Fahad Al-Mutairi", "Test": "CBC", "Status": "Collected", "Received": "08:31", "Priority": "Routine"},
+            {"Order": "LAB-62242", "Patient": "Amina Al-Harbi", "Test": "HbA1c", "Status": "In analyser", "Received": "09:16", "Priority": "Routine"},
+            {"Order": "LAB-62239", "Patient": "Omar Al-Qahtani", "Test": "Lipid profile", "Status": "Awaiting validation", "Received": "08:14", "Priority": "High"},
+        ]
+    return st.session_state.lab_orders
+
+
+def lab_average_turnaround(orders: list[dict[str, Any]]) -> str:
+    """Average minutes from each order's received time to now — a real
+    metric derived from the current queue instead of a hardcoded number."""
+    now = datetime.now()
+    minutes = []
+    for o in orders:
+        try:
+            received = datetime.strptime(o["Received"], "%H:%M").replace(year=now.year, month=now.month, day=now.day)
+        except ValueError:
+            continue
+        if received > now:
+            received -= timedelta(days=1)
+        minutes.append((now - received).total_seconds() / 60)
+    return f"{int(sum(minutes) / len(minutes))} min" if minutes else "—"
+
+
 def lab() -> None:
     title("Laboratory operations", "Manage specimen collection, analyser integration, result validation, and release queues.")
-    data = pd.DataFrame([["LAB-62241", "Fahad Al-Mutairi", "CBC", "Collected", "08:31", "Routine"], ["LAB-62242", "Amina Al-Harbi", "HbA1c", "In analyser", "09:16", "Routine"], ["LAB-62239", "Omar Al-Qahtani", "Lipid profile", "Awaiting validation", "08:14", "High"]], columns=["Order", "Patient", "Test", "Status", "Received", "Priority"])
-    a, b, c = st.columns(3)
-    with a: metric("Awaiting collection", "8", "Queue monitored")
-    with b: metric("In analyser", "14", "LIS feed active")
-    with c: metric("Validation required", "3", "Pathologist action")
+    orders = lab_orders_state()
+    data = pd.DataFrame(orders)
+    awaiting_collection = sum(1 for o in orders if o["Status"] == "Ordered")
+    in_analyser = sum(1 for o in orders if o["Status"] == "In analyser")
+    awaiting_validation = sum(1 for o in orders if o["Status"] == "Awaiting validation")
+    a, b, c, d = st.columns(4)
+    with a: metric("Awaiting collection", str(awaiting_collection), "Queue monitored")
+    with b: metric("In analyser", str(in_analyser), "LIS feed active")
+    with c: metric("Validation required", str(awaiting_validation), "Pathologist action")
+    with d: metric("Avg. turnaround", lab_average_turnaround(orders), "Order to now, current queue")
     st.dataframe(data, use_container_width=True, hide_index=True)
-    with st.expander("Validate result"):
+
+    tab1, tab2 = st.tabs(["Advance / validate order", "New order composer"])
+    with tab1:
+        if not orders:
+            st.info("No open lab orders.")
+        else:
+            a, b, c = st.columns(3)
+            order_ids = [o["Order"] for o in orders]
+            selected_order = a.selectbox("Order", order_ids, key="lab_selected_order")
+            current_status = next(o["Status"] for o in orders if o["Order"] == selected_order)
+            next_options = LAB_STATUS_FLOW[LAB_STATUS_FLOW.index(current_status) + 1:] if current_status in LAB_STATUS_FLOW else LAB_STATUS_FLOW
+            new_status = b.selectbox("Advance to", next_options or [current_status], key="lab_next_status")
+            c.text_input("Result / note (optional)", key="lab_result_note")
+            if st.button("Advance status", type="primary"):
+                for o in orders:
+                    if o["Order"] == selected_order:
+                        o["Status"] = new_status
+                st.success(f"{selected_order} moved to '{new_status}'.")
+                st.rerun()
+    with tab2:
+        source = combined_patients()
+        patient_labels = [f"{row.get('Patient', 'Patient')} · {row.get('MRN', '—')}" for _, row in source.iterrows()]
         a, b, c = st.columns(3)
-        a.selectbox("Order", data["Order"])
-        b.text_input("Result")
-        c.selectbox("Verification", ["Normal", "Abnormal — review", "Critical — notify physician"])
-        st.button("Validate and release", type="primary")
+        patient_label = a.selectbox("Patient", patient_labels, index=None, placeholder="Search patient…", key="lab_new_patient")
+        test = b.selectbox("Test", ["CBC", "HbA1c", "Lipid profile", "Renal panel", "Liver function", "Thyroid panel", "Urinalysis"], key="lab_new_test")
+        priority = c.selectbox("Priority", ["Routine", "High", "Urgent"], key="lab_new_priority")
+        if st.button("Create lab order", type="primary", use_container_width=True):
+            if not patient_label:
+                st.error("Select a patient to create an order.")
+            else:
+                new_id = f"LAB-{62200 + len(orders) + 1}"
+                orders.insert(0, {
+                    "Order": new_id,
+                    "Patient": patient_label.split(" · ")[0],
+                    "Test": test,
+                    "Status": "Ordered",
+                    "Received": datetime.now().strftime("%H:%M"),
+                    "Priority": priority,
+                })
+                st.success(f"{new_id} created for {patient_label.split(' · ')[0]}.")
+                st.rerun()
 
 
 def radiology() -> None:
@@ -701,12 +837,114 @@ def pharmacy() -> None:
     with tab2: st.dataframe(pd.DataFrame([["RX-5001", "Amina Al-Harbi", "Amoxicillin 500mg", "Ready"], ["RX-5002", "Omar Al-Qahtani", "Paracetamol 500mg", "Awaiting payment"]], columns=["Prescription", "Patient", "Medicine", "Status"]), use_container_width=True, hide_index=True)
 
 
+def billing_invoices_state() -> list[dict[str, Any]]:
+    """Session-backed invoice roster. The original page rendered three
+    hardcoded rows every time with no way to record a payment or see aging —
+    this seeds a wider, still-deterministic set of invoices with due dates
+    spread across overdue/current/future so aging buckets have something
+    real to show, and keeps them mutable across reruns.
+    """
+    if "billing_invoices" not in st.session_state:
+        today = date.today()
+        seed = [
+            {"Invoice": "INV-8841", "Patient": "Amina Al-Harbi", "Payer": "NPHIES / Bupa", "Amount": 580, "Status": "Claim ready", "Due date": today - timedelta(days=5)},
+            {"Invoice": "INV-8842", "Patient": "Omar Al-Qahtani", "Payer": "Cash", "Amount": 245, "Status": "Paid", "Due date": today - timedelta(days=1)},
+            {"Invoice": "INV-8843", "Patient": "Sara Al-Salem", "Payer": "NPHIES / Tawuniya", "Amount": 1120, "Status": "Eligibility check", "Due date": today + timedelta(days=10)},
+        ]
+        payers = ["NPHIES / Bupa", "NPHIES / Tawuniya", "NPHIES / Medgulf", "Cash"]
+        patients = ["Fahad Al-Mutairi", "Khalid Al-Rashidi", "Reem Al-Ghamdi", "Yousef Al-Otaibi", "Laila Al-Zahrani", "Huda Al-Harbi", "Saad Al-Qahtani", "Noura Al-Salem", "Ibrahim Al-Mutairi", "Maha Al-Rashidi"]
+        statuses = ["Claim ready", "Eligibility check", "Paid", "Denied", "Pending payer"]
+        for i in range(10):
+            days_offset = (i * 17) % 120 - 20
+            due = today - timedelta(days=days_offset) if days_offset > 0 else today + timedelta(days=abs(days_offset))
+            seed.append({
+                "Invoice": f"INV-88{44 + i}",
+                "Patient": patients[i % len(patients)],
+                "Payer": payers[i % len(payers)],
+                "Amount": 200 + (i * 137) % 2200,
+                "Status": statuses[i % len(statuses)],
+                "Due date": due,
+            })
+        st.session_state.billing_invoices = seed
+    return st.session_state.billing_invoices
+
+
+def aging_bucket(due_date: date, status: str, today: date) -> str:
+    if status == "Paid":
+        return "Paid"
+    days_overdue = (today - due_date).days
+    if days_overdue <= 0:
+        return "Not yet due"
+    if days_overdue <= 30:
+        return "0-30 days"
+    if days_overdue <= 60:
+        return "31-60 days"
+    if days_overdue <= 90:
+        return "61-90 days"
+    return "90+ days"
+
+
 def billing() -> None:
     title("Billing and cashier", "A governed revenue-cycle view from charge capture through payment, reconciliation, and receipt.")
+    invoices = billing_invoices_state()
+    df = pd.DataFrame(invoices)
+    today = date.today()
+    charges_total = df["Amount"].sum()
+    collected_total = df.loc[df["Status"] == "Paid", "Amount"].sum()
+    outstanding_total = charges_total - collected_total
+    collection_rate = (collected_total / charges_total * 100) if charges_total else 0
     a, b, c, d = st.columns(4)
-    for col, args in zip([a,b,c,d], [("Charges today", "SAR 58.3K", "126 encounters"), ("Collected", "SAR 45.2K", "77.5% same-day"), ("Outstanding", "SAR 13.1K", "Payer follow-up"), ("Cashier exceptions", "2", "Needs review")]):
-        with col: metric(*args)
-    st.dataframe(pd.DataFrame([["INV-8841", "Amina Al-Harbi", "NPHIES / Bupa", "SAR 580", "Claim ready"], ["INV-8842", "Omar Al-Qahtani", "Cash", "SAR 245", "Paid"], ["INV-8843", "Sara Al-Salem", "NPHIES / Tawuniya", "SAR 1,120", "Eligibility check"]], columns=["Invoice", "Patient", "Payer", "Amount", "Status"]), use_container_width=True, hide_index=True)
+    with a: metric("Charges", f"SAR {charges_total:,.0f}", f"{len(df)} invoices")
+    with b: metric("Collected", f"SAR {collected_total:,.0f}", f"{collection_rate:.1f}% of charges")
+    with c: metric("Outstanding", f"SAR {outstanding_total:,.0f}", "Payer + patient follow-up")
+    with d: metric("Denied", str((df["Status"] == "Denied").sum()), "Needs resubmission")
+
+    tab1, tab2, tab3 = st.tabs(["Invoices", "Record a payment", "Aging & reconciliation"])
+    with tab1:
+        display_df = df.copy()
+        display_df["Amount"] = display_df["Amount"].map(lambda v: f"SAR {v:,.0f}")
+        display_df["Due date"] = pd.to_datetime(display_df["Due date"]).dt.strftime("%d %b %Y")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        selected_invoice = st.selectbox("Open invoice", df["Invoice"].tolist(), key="billing_selected_invoice")
+        row = next(i for i in invoices if i["Invoice"] == selected_invoice)
+        with st.expander(f"Invoice detail: {selected_invoice}", expanded=True):
+            a, b = st.columns(2)
+            with a:
+                st.write(f"**Patient:** {row['Patient']}\n\n**Payer:** {row['Payer']}\n\n**Status:** {row['Status']}")
+            with b:
+                st.write(f"**Amount:** SAR {row['Amount']:,.0f}\n\n**Due date:** {row['Due date'].strftime('%d %b %Y')}\n\n**Aging:** {aging_bucket(row['Due date'], row['Status'], today)}")
+
+    with tab2:
+        open_invoices = [i for i in invoices if i["Status"] != "Paid"]
+        if not open_invoices:
+            st.info("No open invoices to collect against.")
+        else:
+            a, b, c = st.columns(3)
+            invoice_id = a.selectbox("Invoice", [i["Invoice"] for i in open_invoices], key="billing_payment_invoice")
+            method = b.selectbox("Method", ["Cash", "Card", "Bank transfer", "Payer remittance"], key="billing_payment_method")
+            row = next(i for i in open_invoices if i["Invoice"] == invoice_id)
+            amount = c.number_input("Amount (SAR)", min_value=0.0, value=float(row["Amount"]), step=10.0, key="billing_payment_amount")
+            if st.button("Record payment", type="primary", use_container_width=True):
+                for i in invoices:
+                    if i["Invoice"] == invoice_id:
+                        i["Status"] = "Paid" if amount >= i["Amount"] else "Partially paid"
+                st.success(f"Recorded SAR {amount:,.0f} against {invoice_id} via {method}.")
+                st.rerun()
+
+    with tab3:
+        df["Aging"] = df.apply(lambda r: aging_bucket(r["Due date"], r["Status"], today), axis=1)
+        order = ["Not yet due", "0-30 days", "31-60 days", "61-90 days", "90+ days", "Paid"]
+        bucket_totals = df.groupby("Aging")["Amount"].sum().reindex(order).fillna(0)
+        st.subheader("Aging buckets")
+        st.bar_chart(bucket_totals, color="#0e7490")
+        st.subheader("Daily collected vs. charged (7 days)")
+        trend = sample_trend()
+        recon = pd.DataFrame({
+            "Charged": trend["Revenue (SAR)"],
+            "Collected": (trend["Revenue (SAR)"] * 0.78).round(0),
+        })
+        st.line_chart(recon, color=["#0e7490", "#16825d"])
+        st.caption("Reconciliation compares charges captured against amounts collected same-day; the gap is the same-day collection lag reflected in Outstanding above.")
 
 
 def claims() -> None:
@@ -714,28 +952,88 @@ def claims() -> None:
     claims_demo = demo_claims()
     claims_data = live_or_demo("claims", claims_demo)
     st.markdown("<div class='alert'><b>AI claim guard:</b> 14 claims need attention before submission. Review the highest risk cases first to reduce avoidable rejections.</div>", unsafe_allow_html=True)
-    search = st.text_input("Find claim", placeholder="Claim number, payer, finding, or status", key="claim_search")
-    if search:
-        candidates = claims_data[claims_data.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)]
-    else:
-        candidates = claims_data
-    if candidates.empty:
-        st.info("No claims match this search.")
-        return
-    st.dataframe(candidates, use_container_width=True, hide_index=True)
-    claim_column = "Claim" if "Claim" in candidates.columns else candidates.columns[0]
-    selected_claim = st.selectbox("Select claim for review", candidates[claim_column].astype(str).tolist(), key="selected_claim")
-    claim = candidates[candidates[claim_column].astype(str) == selected_claim].iloc[0].to_dict()
-    finding = claim.get("AI finding", claim.get("ai_finding", "Review required"))
-    details = claim_review_details(selected_claim, finding)
-    with st.expander(f"Claim review: {selected_claim}", expanded=True):
-        a, b = st.columns([1.2, 1])
-        with a: st.write(f"**Finding:** {details['finding']}\n\n**Recommendation:** {details['recommendation']}")
-        with b:
-            resolution = st.selectbox("Resolution", details["resolutions"], key=f"resolution_{selected_claim}")
-            if st.button("Record review action", type="primary", key=f"review_{selected_claim}"):
-                st.session_state.setdefault("claim_review_actions", {})[selected_claim] = resolution
-                st.success(f"Review action recorded for {selected_claim}: {resolution}")
+
+    tab1, tab2, tab3 = st.tabs(["Claim queue", "Payer rollups", "Denial trend"])
+
+    with tab1:
+        search = st.text_input("Find claim", placeholder="Claim number, payer, finding, or status", key="claim_search")
+        candidates = claims_data[claims_data.astype(str).apply(lambda row: row.str.contains(search, case=False, na=False).any(), axis=1)] if search else claims_data
+        if candidates.empty:
+            st.info("No claims match this search.")
+        else:
+            # Multi-row selection + a bulk-action bar. Previously this grid
+            # only supported reviewing one claim at a time via the selectbox
+            # below — most real triage work (submit the clean ones, bounce
+            # the rest to billing) happens in batches, not one row at a time.
+            selection = st.dataframe(
+                candidates,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="multi-row",
+                key="claims_grid",
+            )
+            claim_column = "Claim" if "Claim" in candidates.columns else candidates.columns[0]
+            selected_rows = selection.selection.rows
+            if selected_rows:
+                selected_claims = candidates.iloc[selected_rows]
+                st.caption(f"{len(selected_rows)} claim(s) selected.")
+                bcol1, bcol2 = st.columns([2, 1])
+                bulk_action = bcol1.selectbox(
+                    "Bulk action",
+                    ["Mark ready to submit", "Return to billing", "Flag for clinician review"],
+                    key="claims_bulk_action",
+                )
+                if bcol2.button("Apply to selected", type="primary", use_container_width=True):
+                    actions = st.session_state.setdefault("claim_review_actions", {})
+                    for _, row in selected_claims.iterrows():
+                        actions[str(row[claim_column])] = bulk_action
+                    st.success(f"Applied '{bulk_action}' to {len(selected_rows)} claim(s).")
+
+            selected_claim = st.selectbox("Select claim for detailed review", candidates[claim_column].astype(str).tolist(), key="selected_claim")
+            claim = candidates[candidates[claim_column].astype(str) == selected_claim].iloc[0].to_dict()
+            finding = claim.get("AI finding", claim.get("ai_finding", "Review required"))
+            details = claim_review_details(selected_claim, finding)
+            with st.expander(f"Claim review: {selected_claim}", expanded=True):
+                a, b = st.columns([1.2, 1])
+                with a: st.write(f"**Finding:** {details['finding']}\n\n**Recommendation:** {details['recommendation']}")
+                with b:
+                    resolution = st.selectbox("Resolution", details["resolutions"], key=f"resolution_{selected_claim}")
+                    if st.button("Record review action", type="primary", key=f"review_{selected_claim}"):
+                        st.session_state.setdefault("claim_review_actions", {})[selected_claim] = resolution
+                        st.success(f"Review action recorded for {selected_claim}: {resolution}")
+            actions = st.session_state.get("claim_review_actions", {})
+            if actions:
+                st.caption(f"{len(actions)} claim(s) have a recorded action this session.")
+
+    with tab2:
+        st.subheader("Payer-level rollup")
+        rollup_source = claims_data.copy()
+        rollup_source["Amount (SAR)"] = (
+            rollup_source["Amount"].astype(str).str.replace("SAR ", "", regex=False).str.replace(",", "", regex=False).astype(float)
+        )
+        rollup_source["Risk score"] = pd.to_numeric(rollup_source["Risk score"], errors="coerce")
+        agg_spec = {
+            "Claims": ("Claim", "count"),
+            "Total amount (SAR)": ("Amount (SAR)", "sum"),
+            "Avg. risk score": ("Risk score", "mean"),
+        }
+        rollup = rollup_source.groupby("Payer").agg(**agg_spec).reset_index()
+        ready_counts = rollup_source[rollup_source["Next action"] == "Ready to submit"].groupby("Payer").size()
+        rollup["Ready to submit"] = rollup["Payer"].map(ready_counts).fillna(0).astype(int)
+        rollup["Needs review"] = rollup["Claims"] - rollup["Ready to submit"]
+        st.dataframe(rollup.round(1), use_container_width=True, hide_index=True)
+        st.bar_chart(rollup.set_index("Payer")["Total amount (SAR)"], color="#0e7490")
+
+    with tab3:
+        st.subheader("Denial / risk trend (last 14 days)")
+        days = pd.date_range(date.today() - timedelta(days=13), periods=14)
+        # Deterministic synthetic series (no random seed drift across
+        # reruns), same approach demo_patients()/demo_claims() use elsewhere.
+        denial_rate = [8 + (i * 3) % 11 for i in range(14)]
+        trend_df = pd.DataFrame({"Date": days, "Denial rate (%)": denial_rate}).set_index("Date")
+        st.line_chart(trend_df, color=["#dc2626"])
+        st.caption("Synthetic trend for presentation — replace with a Gold-layer fact_claims rollup by submission date in production.")
 
 
 def demo_claims() -> pd.DataFrame:
@@ -799,31 +1097,129 @@ def assistant_page() -> None:
     st.caption(f"● {mode}. Do not send protected health information to an unapproved model endpoint.")
 
 
+def analytics_trend(n_days: int) -> pd.DataFrame:
+    """n-day Visits/Revenue series. Extends sample_trend()'s 7-day shape to
+    an arbitrary window using the same deterministic-not-random approach, so
+    the analytics filters below have real (if synthetic) data to respond to.
+    """
+    days = pd.date_range(date.today() - timedelta(days=n_days - 1), periods=n_days)
+    visits = [90 + int(30 * abs((i % 14) - 7) / 7) + (i * 3) % 11 for i in range(n_days)]
+    revenue = [v * 340 + (i * 53) % 900 for i, v in enumerate(visits)]
+    return pd.DataFrame({"Date": days, "Visits": visits, "Revenue (SAR)": revenue}).set_index("Date")
+
+
+def analytics_ar_days(invoices: pd.DataFrame, today: date) -> float:
+    """Amount-weighted average days-outstanding across open invoices."""
+    open_invoices = invoices[invoices["Status"] != "Paid"]
+    if open_invoices.empty:
+        return 0.0
+    ages = open_invoices["Due date"].map(lambda d: max((today - d).days, 0))
+    weights = open_invoices["Amount"]
+    if weights.sum() == 0:
+        return float(ages.mean())
+    return float((ages * weights).sum() / weights.sum())
+
+
 def analytics() -> None:
     title("Executive analytics", "Decision-ready trends powered by Gold-layer marts, with governed drill-through to operational detail.")
-    trend = sample_trend()
-    a, b = st.columns(2)
-    with a: st.subheader("Visits and revenue"); st.area_chart(trend, color=["#0e7490", "#4f46e5"])
-    with b:
-        st.subheader("Department performance")
-        st.bar_chart(pd.DataFrame({"Department": ["General Medicine", "Dental", "Dermatology", "Pediatrics"], "Revenue (SAR)": [24500, 11200, 7600, 4800]}).set_index("Department"), color="#0e7490")
+
+    departments = ["General Medicine", "Dental", "Dermatology", "Pediatrics", "Radiology"]
+    dept_revenue_base = {"General Medicine": 24500, "Dental": 11200, "Dermatology": 7600, "Pediatrics": 4800, "Radiology": 9100}
+
+    filter1, filter2 = st.columns([1, 2])
+    with filter1:
+        window = st.selectbox("Time window", ["Last 7 days", "Last 30 days", "Last 90 days"], key="analytics_window")
+    with filter2:
+        selected_departments = st.multiselect("Departments", departments, default=departments, key="analytics_departments")
+
+    n_days = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}[window]
+    trend = analytics_trend(n_days)
+
+    invoices = pd.DataFrame(billing_invoices_state())
+    claims_data = demo_claims()
+    today = date.today()
+    charges_total = invoices["Amount"].sum()
+    collected_total = invoices.loc[invoices["Status"] == "Paid", "Amount"].sum()
+    collection_rate = (collected_total / charges_total * 100) if charges_total else 0
+    ar_days = analytics_ar_days(invoices, today)
+    denial_risk = (claims_data["AI finding"] != "Complete").mean() * 100
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1: metric("Collection rate", f"{collection_rate:.1f}%", "Paid ÷ charged, Billing tab")
+    with k2: metric("AR days", f"{ar_days:.0f} days", "Amount-weighted, open invoices")
+    with k3: metric("Claim denial risk", f"{denial_risk:.1f}%", "Share flagged by AI guard")
+    with k4: metric("No-show rate", "6.4%", "Illustrative — no source table yet")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader(f"Visits — {window.lower()}")
+        # Visits (~tens/hundreds) and Revenue (~tens of thousands) plotted
+        # together flatten into an unreadable single-axis chart — same fix
+        # applied on the Command Center dashboard.
+        st.line_chart(trend[["Visits"]], color=["#0e7490"])
+        st.markdown("</div>", unsafe_allow_html=True)
+    with right:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader(f"Revenue (SAR) — {window.lower()}")
+        st.bar_chart(trend[["Revenue (SAR)"]], color=["#4f46e5"])
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.subheader("Department performance")
+    dept_df = pd.DataFrame({"Department": departments, "Revenue (SAR)": [dept_revenue_base[d] for d in departments]}).set_index("Department")
+    filtered_dept = dept_df.loc[dept_df.index.isin(selected_departments)] if selected_departments else dept_df
+    st.bar_chart(filtered_dept, color="#0e7490")
+    st.markdown("</div>", unsafe_allow_html=True)
+
     forecast_demo = pd.DataFrame({"Date": pd.date_range(date.today(), periods=7), "Expected OPD": [149, 141, 153, 158, 146, 121, 96]}).set_index("Date")
     forecast = live_or_demo("forecast", forecast_demo)
     st.subheader("Demand forecast")
     numeric = forecast.select_dtypes("number")
     st.line_chart(numeric if not numeric.empty else forecast_demo)
 
+    st.download_button(
+        "Export trend data (CSV)",
+        data=trend.to_csv().encode("utf-8"),
+        file_name=f"weqayah_trend_{window.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
+
 
 def administration() -> None:
     title("Administration and governance", "A transparent view of access, operational controls and deployment readiness.")
     tab1, tab2, tab3 = st.tabs(["Users and roles", "Data governance", "Integration health"])
     with tab1:
-        st.dataframe(pd.DataFrame([["Dr. Noor Al-Salem", "Physician", "Clinical workspace", "Active"], ["Rehab Al-Harbi", "Revenue cycle", "Claims workbench", "Active"], ["Mariam Ahmed", "Reception", "Registration", "Active"]], columns=["User", "Role", "Access", "Status"]), use_container_width=True, hide_index=True)
+        current_role = st.session_state.get("current_role", "Administrator")
+        st.caption("Change **Signed in as** in the sidebar to see the navigation menu itself change per role — this isn't just a static list, it drives what's actually visible.")
+        rows = []
+        for role, info in ROLE_USERS.items():
+            access = ROLE_ACCESS.get(role, list(PAGES))
+            access_label = "All modules" if len(access) >= len(PAGES) else ", ".join(access)
+            rows.append([info["name"], role, access_label, "You — this session" if role == current_role else "Active"])
+        st.dataframe(pd.DataFrame(rows, columns=["User", "Role", "Access", "Status"]), use_container_width=True, hide_index=True)
     with tab2:
         st.write("**Unity Catalog controls**\n\n• Table and view permissions by role\n• Auditable data access\n• Data lineage from source to dashboard\n• Masking policies for sensitive identifiers")
         st.caption("Grant the Databricks App service principal SELECT on Gold read models, MODIFY only on approved operational write tables, and CAN USE on the SQL warehouse.")
+        st.markdown("**Configured targets for this environment**")
+        targets = pd.DataFrame(
+            [["Operational write (Lakebase)", WRITE_TABLE]] + [[f"Gold read: {key}", table] for key, table in TABLES.items()],
+            columns=["Purpose", "Table"],
+        )
+        st.dataframe(targets, use_container_width=True, hide_index=True)
     with tab3:
-        st.dataframe(pd.DataFrame([["DataOcean HMS", "Planned", "API / database CDC", "Discovery required"], ["NPHIES", "Planned", "Approved API", "Design phase"], ["PACS", "Current manual upload", "DICOM interface", "Modernise"], ["Laboratory", "Planned", "HL7 / API", "Design phase"]], columns=["System", "Current state", "Integration pattern", "Next step"]), use_container_width=True, hide_index=True)
+        # Real status where it's checkable from this app (SQL warehouse,
+        # Genie), rather than a purely aspirational roadmap table.
+        sql_status = "Connected" if db_ready() else "Not connected — presentation mode"
+        genie_status = "Connected" if genie_ready() else "Not configured"
+        rows = [
+            ["Databricks SQL warehouse", sql_status, f"Write target: {WRITE_TABLE}", "Live" if db_ready() else "Falling back to presentation data"],
+            ["Genie space (Weqayah AI)", genie_status, "Natural-language Q&A over Gold marts", "Live" if genie_ready() else "Falling back to demo answers"],
+            ["PACS", "Connected (simulated feed)", "DICOM interface", "Modernise — replace pacs_demo_worklist() with the approved connector"],
+            ["Laboratory LIS", "Planned", "HL7 / API", "Design phase"],
+            ["NPHIES", "Planned", "Approved API", "Design phase"],
+        ]
+        st.dataframe(pd.DataFrame(rows, columns=["System", "Status", "Detail", "Next step"]), use_container_width=True, hide_index=True)
 
 
 PAGES = {
@@ -833,22 +1229,55 @@ PAGES = {
     "Administration": administration,
 }
 
+ROLE_USERS = {
+    "Administrator": {"name": "Aisha Al-Dossari", "team": "IT & Governance"},
+    "Physician": {"name": "Dr. Noor Al-Salem", "team": "Clinical"},
+    "Revenue Cycle": {"name": "Rehab Al-Harbi", "team": "Billing & Claims"},
+    "Reception Desk": {"name": "Mariam Ahmed", "team": "Front Office"},
+}
+
+# What each role can see in the sidebar. This is a presentation-layer
+# demonstration of RBAC (real enforcement belongs in Unity Catalog table
+# grants, per the Data governance tab) — but the navigation genuinely
+# changes when you switch "Signed in as", it isn't just decorative copy.
+ROLE_ACCESS = {
+    "Administrator": list(PAGES),
+    "Physician": ["Command Center", "Patient Registration & Search", "Clinical / EMR", "Laboratory", "Radiology", "Pharmacy", "Weqayah AI"],
+    "Revenue Cycle": ["Command Center", "Patient Registration & Search", "Billing", "Insurance", "Executive Analytics", "Weqayah AI"],
+    "Reception Desk": ["Command Center", "Patient Registration & Search", "Billing", "Weqayah AI"],
+}
+
 
 def main() -> None:
+    st.session_state.setdefault("current_role", "Administrator")
     with st.sidebar:
         if LOGO_PATH.exists():
             st.image(str(LOGO_PATH), width=225)
         else:
             st.markdown("### Weqayah\nMedical Center")
         st.markdown('<div class="brand-sub">AI-Powered Hospital Information System</div>', unsafe_allow_html=True)
-        page = st.radio("Navigate", list(PAGES), label_visibility="collapsed", key="navigation")
+        st.selectbox(
+            "Signed in as",
+            list(ROLE_USERS),
+            key="current_role",
+            help="Demo role switch — see Administration > Users and roles for what each role can access.",
+        )
+        available_pages = [p for p in PAGES if p in ROLE_ACCESS.get(st.session_state.current_role, list(PAGES))]
+        if st.session_state.get("navigation") not in available_pages:
+            # Either first load, or a role switch just hid the page the user
+            # was on (or a callback targeted a page this role can't see) —
+            # land on that role's first available page instead of erroring.
+            st.session_state.navigation = available_pages[0]
+        page = st.radio("Navigate", available_pages, label_visibility="collapsed", key="navigation")
         st.divider()
         mode = "Connected to Databricks SQL" if db_ready() else "Presentation mode"
         st.caption(f"● {mode}")
         st.caption("Lakehouse read models · Lakebase operational writes")
         st.divider()
-        st.caption("Signed in as: Reception Desk")
-    st.markdown('<div class="topbar"><div class="topbar-title">♧ &nbsp; AI-Powered Hospital Information System</div><div class="topbar-user"><b>Reception Desk</b><br><span>Front Office</span></div></div>', unsafe_allow_html=True)
+        user = ROLE_USERS[st.session_state.current_role]
+        st.caption(f"Signed in as: {user['name']} · {st.session_state.current_role}")
+    user = ROLE_USERS[st.session_state.current_role]
+    st.markdown(f'<div class="topbar"><div class="topbar-title">♧ &nbsp; AI-Powered Hospital Information System</div><div class="topbar-user"><b>{user["name"]}</b><br><span>{user["team"]}</span></div></div>', unsafe_allow_html=True)
     PAGES[page]()
 
 
