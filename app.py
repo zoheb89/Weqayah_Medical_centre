@@ -122,7 +122,7 @@ def query(statement: str, params: Optional[list[Any]] = None) -> pd.DataFrame:
 
 def execute(statement: str, params: list[Any]) -> tuple[bool, str]:
     if not db_ready():
-        return False, "Demo mode is active. Configure DATABRICKS_WAREHOUSE_ID to enable governed writes."
+        return True, "Registration saved for this demonstration session."
     try:
         with connection().cursor() as cursor:
             cursor.execute(statement, parameters=params)
@@ -132,12 +132,16 @@ def execute(statement: str, params: list[Any]) -> tuple[bool, str]:
 
 
 def demo_patients() -> pd.DataFrame:
-    return pd.DataFrame([
+    baseline = pd.DataFrame([
         ["MRN-100245", "Amina Al-Harbi", "F", 35, "Active", "NPHIES / Bupa", "Today, 09:15"],
         ["MRN-100246", "Omar Al-Qahtani", "M", 48, "In consultation", "Cash", "Today, 09:06"],
         ["MRN-100247", "Sara Al-Salem", "F", 29, "Waiting", "NPHIES / Tawuniya", "Today, 08:52"],
         ["MRN-100248", "Fahad Al-Mutairi", "M", 61, "Lab pending", "NPHIES / Bupa", "Today, 08:31"],
     ], columns=["MRN", "Patient", "Gender", "Age", "Status", "Payer", "Last activity"])
+    additions = st.session_state.get("demo_registrations", [])
+    if not additions:
+        return baseline
+    return pd.concat([pd.DataFrame(additions), baseline], ignore_index=True)
 
 
 def safe_table(key: str) -> str:
@@ -217,6 +221,16 @@ def registration() -> None:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
                 ok, message = execute(stmt, [str(uuid.uuid4()), mrn, national_id, first_name, last_name, dob, gender, phone, department, payer, visit_type, allergies, datetime.utcnow()])
                 if ok:
+                    if not db_ready():
+                        st.session_state.setdefault("demo_registrations", []).insert(0, {
+                            "MRN": mrn,
+                            "Patient": f"{first_name} {last_name}",
+                            "Gender": gender[:1],
+                            "Age": max(0, date.today().year - dob.year),
+                            "Status": "Registered",
+                            "Payer": payer,
+                            "Last activity": "Just now",
+                        })
                     st.session_state.registration_success = mrn
                     st.rerun()
                 else:
